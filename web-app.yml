@@ -1,0 +1,286 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: default
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+    scrape_configs:
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+      - job_name: "node-exporter"
+        static_configs:
+          - targets: ["node-exporter:9100"]
+      - job_name: "cadvisor"
+        static_configs:
+          - targets: ["cadvisor:8080"]
+      - job_name: 'CAPsMAN'
+        static_configs:
+          - targets:
+            - 10.10.13.33 # Mikrotik device.
+        metrics_path: /snmp
+        params:
+          module: [mikrotik]
+        relabel_configs:
+          - source_labels: [__address__]
+            target_label: __param_target
+          - source_labels: [__param_target]
+            target_label: instance
+          - target_label: __address__
+            replacement: 192.168.59.104:9116
+      - job_name: 'Windows'
+        static_configs:
+          - targets: ['10.10.13.3:9182']
+  alert_rules.yml: |
+    groups:
+    - name: Prometheus self-monitoring
+      rules:
+      - alert: Prometheus target missing
+        expr: 'up == 0'
+        annotations:
+        description: A Prometheus target has disappeared. An exporter might be crashed.
+        labels:
+          severity: critical
+      - alert: Prometheus AlertManager config not synced
+        expr: 'count(count_values("config_hash", alertmanager_config_hash)) > 1'
+        annotations:
+        description: Configurations of AlertManager cluster instances are out of sync
+        labels:
+          severity: warning
+      - alert: Prometheus target scraping slow
+        expr: 'prometheus_target_interval_length_seconds{quantile="0.9"} > 60'
+        annotations:
+        description: Prometheus is scraping exporters slowly
+        labels:
+          severity: warning
+        for: 5m
+    - name: Host and hardware
+      rules:
+      - alert: Host out of memory
+        expr: 'node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes * 100 < 10'
+        annotations:
+        description: Node memory is filling up (< 10% left)
+        labels:
+          severity: warning
+        for: 2m
+      - alert: Host out of disk space
+        expr: '(node_filesystem_avail_bytes * 100) / node_filesystem_size_bytes < 10 and ON (instance, device, mountpoint) node_filesystem_readonly == 0'
+        annotations:
+        description: Disk is almost full (< 10% left)
+        labels:
+          severity: warning
+        for: 2m
+      - alert: Host high CPU load
+        expr: '100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[2m])) * 100) > 80'
+        annotations:
+        description: CPU load is > 80%
+        labels:
+          severity: warning
+      - alert: Host OOM kill detected
+        expr: 'increase(node_vmstat_oom_kill[1m]) > 0'
+        annotations:
+        description: OOM kill detected
+        labels:
+          severity: warning
+      - alert: Host clock skew
+        expr: '(node_timex_offset_seconds > 0.05 and deriv(node_timex_offset_seconds[5m]) >= 0) or (node_timex_offset_seconds < -0.05 and deriv(node_timex_offset_seconds[5m]) <= 0)'
+        annotations:
+        description: 'Clock skew detected. Clock is out of sync.'
+        labels:
+          severity: warning
+        for: 2m
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: default
+data:
+  alertmanager.yml: |
+    route:
+      receiver: 'telegram'
+      routes:    
+      # All alerts with severity=warning or severity=critical
+      # are dispatched to the telegram receiver.
+      - receiver: 'telegram'
+        group_wait: 10s
+        matchers:
+        - severity=~"warning|critical|firing"
+
+    receivers:
+    - name: 'telegram'
+      telegram_configs:
+      - bot_token: "6395608817:AAG0t7b_P8NmTjScDejKFH-idEY1iohvjeY"
+        chat_id: -4113318976
+
+    #  https://api.telegram.org/botINSERT_BOT_ID_HERE/getUpdates - to get chat_id
+    #  amtool --alertmanager.url=http://localhost:9093/ alert add alertname="Test alert" severity="warning" job="test-job" - to send te
+---
+
+
+
+
+# apiVersion: v1
+# kind: PersistentVolumeClaim
+# metadata:
+#   name: prom-data-pvc
+#   namespace: default
+# spec:
+#   accessModes:
+#     - ReadWriteOnce
+#   resources:
+#     requests:
+#       storage: 200Mi
+# ---
+# apiVersion: v1
+# kind: PersistentVolumeClaim
+# metadata:
+#   name: alertmanager-storage-pvc
+#   namespace: default
+# spec:
+#   accessModes:
+#     - ReadWriteOnce
+#   resources:
+#     requests:
+#       storage: 200Mi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: monitoring-stack
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: monitoring-stack
+  template:
+    metadata:
+      labels:
+        app: monitoring-stack
+    spec:
+      containers:
+      - name: grafana
+        image: grafana/grafana:latest
+        ports:
+        - containerPort: 3000
+        env:
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          value: "ubuntu"
+          
+      - name: prometheus
+        image: prom/prometheus:latest
+        ports:
+        - containerPort: 9090
+        volumeMounts:
+        # - name: prom-storage
+        #   mountPath: /prometheus
+        - name: prom-config
+          mountPath: /etc/prometheus/prometheus.yml
+          subPath: prometheus.yml
+        - name: prom-alert-rules
+          mountPath: /etc/prometheus/alert_rules.yml
+          subPath: alert_rules.yml
+        args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+            - "--web.external-url=http://127.0.0.1:9090"
+            - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+            - "--web.console.templates=/usr/share/prometheus/consoles"
+      - name: node-exporter
+        image: prom/node-exporter:latest
+        ports:
+        - containerPort: 9100
+      - name: alertmanager
+        image: prom/alertmanager:v0.25.0
+        args:
+        - "--config.file=/etc/alertmanager/alertmanager.yml"
+        - "--storage.path=/alertmanager"
+        - "--web.external-url=http://127.0.0.1:9093"
+        ports:
+        - containerPort: 9093
+        volumeMounts:
+        - name: alertmanager-config
+          mountPath: /etc/alertmanager/alertmanager.yml
+          subPath: alertmanager.yml
+        # - name: alertmanager-storage
+        #   mountPath: /alertmanager
+      volumes:
+      - name: prometheus-storage
+        emptyDir: {}
+      # - name: prom-storage
+      #   persistentVolumeClaim:
+      #     claimName: prom-data-pvc
+      # - name: alertmanager-storage
+      #   persistentVolumeClaim:
+      #     claimName: alertmanager-storage-pvc
+      - name: prom-config
+        configMap:
+          name: prometheus-config
+      - name: prom-alert-rules
+        configMap:
+          name: prometheus-config
+      - name: alertmanager-config
+        configMap:
+          name: alertmanager-config
+      
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: monitoring-stack-grafana
+spec:
+  selector:
+    app: monitoring-stack
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 3000
+  type: NodePort
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: monitoring-stack-prometheus
+spec:
+  selector:
+    app: monitoring-stack
+  ports:
+    - protocol: TCP
+      port: 9090
+      targetPort: 9090
+  type: NodePort
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: monitoring-stack-node-exporter
+spec:
+  selector:
+    app: monitoring-stack
+  ports:
+    - protocol: TCP
+      port: 9100
+      targetPort: 9100
+  type: NodePort
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanaager
+spec:
+  selector:
+    app: monitoring-stack
+  ports:
+    - protocol: TCP
+      port: 9093
+      targetPort: 9093
+  type: NodePort
+
+  
